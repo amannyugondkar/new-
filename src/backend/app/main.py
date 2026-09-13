@@ -7,6 +7,7 @@ from sqlalchemy import select
 from .db import Base,engine,SessionLocal,User,Transaction
 from .core import Role,hash_password,verify_password,token_for,SECRET
 from .services import seed_transactions,metrics,grounded_assistant,categorize
+from .anomaly_service import annotate_transactions,REVIEW_THRESHOLD
 app=FastAPI(title='FinSight AI'); app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:3000'],allow_credentials=True,allow_methods=['*'],allow_headers=['*']); oauth=OAuth2PasswordBearer(tokenUrl='/api/auth/login')
 def db():
  s=SessionLocal()
@@ -41,7 +42,12 @@ def login(x:Login,s=Depends(db)):
  return {'access_token':token_for(u.id,u.role),'token_type':'bearer','role':u.role}
 @app.get('/api/auth/me')
 def me(u=Depends(current)):return {'email':u.email,'role':u.role,'customer_id':u.customer_id}
-def transactions_for(u,s): return list(s.scalars(select(Transaction).where(Transaction.customer_id==u.customer_id).order_by(Transaction.timestamp))) if u.role=='CUSTOMER' else list(s.scalars(select(Transaction).order_by(Transaction.timestamp)))
+def transactions_for(u,s):
+ # Single choke point: every consumer (dashboard, transactions, anomalies,
+ # assistant) goes through this, and every row is annotated by the same
+ # anomaly_service evaluation, so there is one consistent anomaly source of truth.
+ rows=list(s.scalars(select(Transaction).where(Transaction.customer_id==u.customer_id).order_by(Transaction.timestamp))) if u.role=='CUSTOMER' else list(s.scalars(select(Transaction).order_by(Transaction.timestamp)))
+ return annotate_transactions(rows)
 @app.get('/api/dashboard')
 def dashboard(u=Depends(current),s=Depends(db)):return metrics(transactions_for(u,s))
 @app.get('/api/profile')
@@ -49,7 +55,7 @@ def profile(u=Depends(current),s=Depends(db)):return metrics(transactions_for(u,
 @app.get('/api/transactions')
 def transactions(u=Depends(current),s=Depends(db)):return transactions_for(u,s)
 @app.get('/api/anomalies')
-def anomalies(u=Depends(current),s=Depends(db)):return [t for t in transactions_for(u,s) if t.anomaly_score>=.6]
+def anomalies(u=Depends(current),s=Depends(db)):return [t for t in transactions_for(u,s) if t.anomaly_score>=REVIEW_THRESHOLD]
 @app.post('/api/anomalies/{transaction_id}/review')
 def review(transaction_id:int,x:Review,u=Depends(require('BANK_ANALYST','ADMIN')),s=Depends(db)):
  t=s.get(Transaction,transaction_id)
@@ -57,7 +63,7 @@ def review(transaction_id:int,x:Review,u=Depends(require('BANK_ANALYST','ADMIN')
  t.review_status=x.action.upper();s.commit();return {'id':t.id,'review_status':t.review_status}
 @app.post('/api/assistant/query')
 def ask(x:Ask,u=Depends(current),s=Depends(db)):
- answer, provider, facts = grounded_assistant(x.question, transactions_for(u,s))
- return {'answer':answer,'grounded':True,'provider':provider,'facts':facts}
+ answer, provider, facts, tool_used = grounded_assistant(x.question, transactions_for(u,s))
+ return {'answer':answer,'grounded':True,'provider':provider,'facts':facts,'tool_used':tool_used}
 @app.post('/api/categorize')
 def classify(description:str,u=Depends(current)): c,p=categorize(description);return {'category':c,'confidence':p}
